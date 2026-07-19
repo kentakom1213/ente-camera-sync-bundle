@@ -1,0 +1,16 @@
+[Unit]
+Description=Export Ente photos and organize them into Camera/YYYY/MM
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/ente-camera-sync --run-export --apply --export-root /data/ente-export --camera-root %h/Pictures/Camera --timezone Asia/Tokyo
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

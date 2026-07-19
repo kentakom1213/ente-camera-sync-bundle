@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Ente Camera sync daily
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=15m
+Unit=ente-camera-sync.service
+
+[Install]
+WantedBy=timers.target
