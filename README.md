@@ -1,5 +1,13 @@
 # Ente Camera Sync
 
+## Ente CLI v0.4.5 に対応する差分ダウンロード（プレビュー）
+
+従来のエクスポート方式とは別に，新しいSQLiteとEnte CLIの個別ダウンロードを使用する
+追加専用のプレビュー実装を用意しています．**まだ自動実行には使用しません．**
+初期移行と手動テストの手順は [V04-INCREMENTAL-SYNC.md](V04-INCREMENTAL-SYNC.md) を参照してください．
+
+以下は従来のエクスポート方式の説明です．
+
 Ente CLIで写真・動画をエクスポートし，`~/Pictures/Camera/YYYY/MM`へ
 追加専用で整理するためのスクリプトです．
 
