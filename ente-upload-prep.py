@@ -480,7 +480,7 @@ def prepare(args, root, rows, timestamp):
         print(f"  {row['relative_path']} -> {row['staged']}")
     if len(planned) > 40:
         print(f"  ... and {len(planned) - 40} more")
-    if not args.apply:
+    if args.dry_run:
         print("Dry run: staging not created.")
         return
     if not planned:
@@ -573,10 +573,8 @@ def parser():
             c.add_argument("--output", type=Path)
         else:
             c.add_argument("--output", required=True, type=Path)
-            mode = c.add_mutually_exclusive_group()
-            mode.add_argument("--apply", action="store_true", help="Actually create a staging batch")
-            mode.add_argument("--dry-run", action="store_true",
-                              help="Preview only; leave staging and persistent SQLite unchanged (default)")
+            c.add_argument("--dry-run", action="store_true",
+                           help="Preview without creating staging or changing persistent SQLite")
             c.add_argument("--flatten", action="store_true",
                            help="Place all chosen files directly in media/")
     verify_cmd = commands.add_parser("verify-upload")
@@ -619,7 +617,7 @@ def main(argv=None):
         # A preview must not create or update the preparation DB or lock file.
         # Clone a consistent snapshot into RAM; queries and refreshes can write
         # to the in-memory copy without affecting persistent state.
-        if args.command == "prepare-upload" and not args.apply:
+        if args.command == "prepare-upload" and args.dry_run:
             with closing(sqlite3.connect(":memory:")) as scratch:
                 if path.exists():
                     if not path.is_file():
