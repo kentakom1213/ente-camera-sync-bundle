@@ -23,7 +23,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-import uuid
+import unicodedata
 from urllib.parse import quote
 
 IMAGES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".avif", ".gif",
@@ -111,17 +111,6 @@ def init_db(conn, account):
             PRIMARY KEY(file_id, hash)
         );
         CREATE INDEX IF NOT EXISTS history_hash_idx ON ente_history(hash);
-        CREATE TABLE IF NOT EXISTS batches(
-            batch_id TEXT PRIMARY KEY, account TEXT NOT NULL, source_root TEXT NOT NULL,
-            destination TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS batch_files(
-            batch_id TEXT NOT NULL, source TEXT NOT NULL, staged TEXT NOT NULL,
-            hash TEXT NOT NULL, size INTEGER NOT NULL, pair_id TEXT,
-            verified TEXT NOT NULL DEFAULT 'pending',
-            PRIMARY KEY(batch_id, source)
-        );
-        CREATE INDEX IF NOT EXISTS batch_hash_idx ON batch_files(hash);
     """)
     schema = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
     if schema and schema[0] != "1":
@@ -134,7 +123,6 @@ def init_db(conn, account):
     if not saved:
         conn.execute("INSERT INTO meta VALUES ('account', ?)", (account,))
     conn.commit()
-
 
 def readonly_connection(path):
     uri = f"file:{quote(str(path.resolve(strict=True)), safe='/')}?mode=ro"
@@ -269,9 +257,9 @@ def scan(db, args, root, current, timestamp):
             (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev,
              stat.st_ino, sha, digest, timestamp))
         matches = current_by_hash.get(digest, [])
+        exact_name = any(item.get("name") == path.name for item in matches)
         if matches:
-            exact_name = any(item.get("name") == path.name for item in matches)
-            status = "uploaded" if exact_name else "uploaded_renamed"
+            status = "uploaded"
         elif digest in history_ids:
             status = "previously_seen"
         else:
@@ -279,6 +267,8 @@ def scan(db, args, root, current, timestamp):
         rows.append({"path": str(path), "relative_path": path.relative_to(root).as_posix(),
                      "size": stat.st_size, "sha256": sha, "hash": digest, "kind": kind,
                      "status": status, "reason": "", "pair_id": None,
+                     "name_mismatch": bool(matches and not exact_name),
+                     "duplicate_of": None,
                      "matching_ente_ids": sorted({m["id"] for m in matches}),
                      "historical_ente_ids": sorted(history_ids.get(digest, set()))})
     db.commit()
@@ -318,43 +308,44 @@ def tag_livephoto_pairs(rows, current):
 
 
 def tag_duplicates(rows):
-    seen_pairs = {}
-    known_hashes = {}
+    """Identify redundant copies without creating a separate file status."""
+    known = {}
     pairs = defaultdict(list)
     for row in rows:
         if row["pair_id"]:
             pairs[row["pair_id"]].append(row)
+    seen_pairs = {}
     for pair_id, group in sorted(pairs.items()):
-        if len(group) != 2 or any(r["status"] != "local_only" for r in group):
+        if len(group) != 2 or any(row["status"] != "local_only" for row in group):
             continue
-        sig = tuple(sorted(r["hash"] for r in group))
-        if sig in seen_pairs:
+        signature = tuple(sorted(row["hash"] for row in group))
+        previous = seen_pairs.get(signature)
+        if previous:
             for row in group:
-                row["status"], row["reason"] = "local_duplicate", seen_pairs[sig]
+                row["duplicate_of"] = previous
         else:
-            seen_pairs[sig] = pair_id
+            seen_pairs[signature] = pair_id
             for row in group:
-                known_hashes[row["hash"]] = row["relative_path"]
-    for row in rows:
+                known.setdefault(row["hash"], row["relative_path"])
+    for row in sorted(rows, key=lambda item: item["relative_path"]):
         if row["status"] != "local_only" or row["pair_id"]:
             continue
-        if row["hash"] in known_hashes:
-            row["status"], row["reason"] = "local_duplicate", known_hashes[row["hash"]]
+        previous = known.get(row["hash"])
+        if previous:
+            row["duplicate_of"] = previous
         else:
-            known_hashes[row["hash"]] = row["relative_path"]
-
+            known[row["hash"]] = row["relative_path"]
 
 def display(rows, root, fmt, output):
     counts = Counter(row["status"] for row in rows)
     print(f"Scanned {len(rows)} media files in {root}:", file=sys.stderr)
     for key, value in sorted(counts.items()):
         print(f"  {key}: {value}", file=sys.stderr)
-    total = sum(r["size"] for r in rows if r["status"] == "local_only")
-    print(f"  local_only_bytes: {total}", file=sys.stderr)
+    candidates = [r for r in rows if r["status"] == "local_only" and not r["duplicate_of"]]
+    print(f"  upload_candidates: {len(candidates)}", file=sys.stderr)
+    print(f"  local_only_bytes: {sum(r['size'] for r in candidates)}", file=sys.stderr)
     by_dir = defaultdict(lambda: {"files": 0, "bytes": 0})
-    for row in rows:
-        if row["status"] != "local_only":
-            continue
+    for row in candidates:
         parts = Path(row["relative_path"]).parts[:-1]
         group = "/".join(parts[:2]) if parts else "."
         by_dir[group]["files"] += 1
@@ -362,7 +353,7 @@ def display(rows, root, fmt, output):
     for group, stats in sorted(by_dir.items()):
         print(f"    {group}: {stats['files']} files, {stats['bytes']} bytes", file=sys.stderr)
     keys = ("relative_path", "status", "size", "hash", "sha256", "reason", "pair_id",
-            "matching_ente_ids", "historical_ente_ids")
+            "name_mismatch", "duplicate_of", "matching_ente_ids", "historical_ente_ids")
     if fmt == "json":
         content = json.dumps({"root": str(root), "summary": dict(counts),
                               "by_directory": dict(by_dir), "files": rows},
@@ -372,12 +363,14 @@ def display(rows, root, fmt, output):
         writer = csv.DictWriter(stream, fieldnames=keys)
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: json.dumps(row[k]) if k in {"matching_ente_ids", "historical_ente_ids"} else row[k]
-                             for k in keys})
+            writer.writerow({k: json.dumps(row[k]) if k in {"matching_ente_ids", "historical_ente_ids"}
+                             else row[k] for k in keys})
         content = stream.getvalue()
     else:
-        content = "".join(f"{r['status']}\t{r['relative_path']}\n" for r in rows
-                          if r["status"] not in ("uploaded", "uploaded_renamed"))
+        content = "".join(
+            f"{r['status']}\t{r['relative_path']}"
+            + (f"\tduplicate_of={r['duplicate_of']}" if r["duplicate_of"] else "") + "\n"
+            for r in rows if r["status"] != "uploaded")
     if output:
         if output.exists() or output.is_symlink():
             raise PrepError(f"Refusing to overwrite report: {output}")
@@ -389,7 +382,6 @@ def display(rows, root, fmt, output):
             handle.write(content)
     else:
         print(content, end="")
-
 
 def parse_size(value):
     match = re.fullmatch(r"(\d+)(B|KiB|MiB|GiB)?", value, re.IGNORECASE)
