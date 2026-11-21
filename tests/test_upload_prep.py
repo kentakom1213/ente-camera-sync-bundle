@@ -203,6 +203,24 @@ class UploadPrepTest(unittest.TestCase):
         self.assertEqual((target / "manifest.json").stat().st_mode & 0o777, 0o600)
 
 
+    def test_camera_database_is_read_only(self):
+        camera_file = self.file("Camera/known.jpg", b"known file")
+        st = camera_file.stat()
+        with sqlite3.connect(self.camera_db) as conn:
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT)")
+            conn.execute("INSERT INTO meta VALUES ('account','test')")
+            conn.execute("CREATE TABLE ente_files(file_id TEXT,hash TEXT,name TEXT,type TEXT,last_seen_at TEXT,account TEXT)")
+            conn.execute("CREATE TABLE local_files(path TEXT,size INT,mtime_ns INT,sha256 TEXT,blake2b TEXT)")
+            conn.execute("INSERT INTO local_files VALUES(?,?,?,?,?)",
+                         (str(camera_file), st.st_size, st.st_mtime_ns,
+                          hashlib.sha256(b"known file").hexdigest(), digest(b"known file")))
+        before = self.camera_db.read_bytes()
+        with patch.object(prep, "hash_file", side_effect=AssertionError("rehashed camera file")):
+            rc, report, err = self.report(remote=[])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(before, self.camera_db.read_bytes())
+        self.assertEqual(report["files"][0]["hash"], digest(b"known file"))
+
     def test_staging_in_source_refused(self):
         self.file("photo.jpg", b"photo")
         nested = self.pictures / "staging"
