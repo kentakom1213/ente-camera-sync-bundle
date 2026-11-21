@@ -1,5 +1,21 @@
 # Ente Camera Sync
 
+## 未アップロード画像の検出・Ente Desktop 向け準備
+
+`ente-upload-prep.py` は，任意のディレクトリ（例：`~/Pictures` 全体）の画像・動画を走査し，Ente に存在しない内容を一覧化します．過去の Ente メタデータも保存して再アップロード候補から除外します．
+
+```zsh
+python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" local-only ~/Pictures
+python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
+  prepare-upload ~/Pictures --output ~/share/ente-upload/batch-001 --apply
+python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
+  verify-upload ~/share/ente-upload/batch-001/manifest.json
+```
+
+ステージングは元のフォルダ構造を維持し，Reflink を優先，未対応なら Copy します．**Ente へのアップロード操作は実装しておらず，`media/` を Ente Desktop から手動で取り込みます．** 既存の Camera 同期 DB は読み取り専用です．
+
+詳細と注意事項は [LOCAL-UPLOAD-PREPARATION.md](LOCAL-UPLOAD-PREPARATION.md) を参照してください．
+
 ## Ente CLI v0.4.5 に対応する差分ダウンロード（プレビュー）
 
 従来のエクスポート方式とは別に，新しいSQLiteとEnte CLIの個別ダウンロードを使用する
