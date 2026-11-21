@@ -464,7 +464,7 @@ def safe_replicate(source, dest, expected):
     return method
 
 
-def prepare(db, args, root, rows, timestamp):
+def prepare(args, root, rows, timestamp):
     output = args.output.expanduser().absolute()
     parent = output.parent.resolve(strict=True)
     output = parent / output.name
@@ -472,53 +472,40 @@ def prepare(db, args, root, rows, timestamp):
         raise PrepError("Staging must be outside the scanned source tree")
     if output.exists() or output.is_symlink():
         raise PrepError(f"Staging directory already exists: {output}")
-    chosen, size = select_batch(rows, db, args)
-    print(f"Selected {len(chosen)} files ({size} bytes) for {output}")
-    for row in chosen[:40]:
-        print(f"  {row['relative_path']}")
-    if len(chosen) > 40:
-        print(f"  ... and {len(chosen)-40} more")
+
+    planned = plan(rows, args.flatten)
+    total = sum(row["size"] for row in planned)
+    print(f"Selected {len(planned)} files ({total} bytes) for {output}")
+    for row in planned[:40]:
+        print(f"  {row['relative_path']} -> {row['staged']}")
+    if len(planned) > 40:
+        print(f"  ... and {len(planned) - 40} more")
     if not args.apply:
         print("Dry run: staging not created.")
         return
-    if not chosen:
+    if not planned:
         raise PrepError("No eligible files to stage")
+
     output.mkdir(mode=0o700)
-    batch_id = str(uuid.uuid4())
-    manifest = {"format_version": 1, "batch_id": batch_id, "account": args.account,
-                "source_root": str(root), "created_at": now(),
-                "remote_snapshot_at": timestamp, "files": []}
-    for row in chosen:
-        target = output / "media" / row["relative_path"]
+    manifest = {"format_version": 1, "account": args.account, "source_root": str(root),
+                "created_at": now(), "remote_snapshot_at": timestamp,
+                "flatten": args.flatten, "files": []}
+    for row in planned:
+        target = output / row["staged"]
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         method = safe_replicate(Path(row["path"]), target, row)
-        manifest["files"].append({k: row[k] for k in
-                                  ("path", "relative_path", "size", "hash", "sha256", "pair_id")}
-                                 | {"staged": (Path("media") / row["relative_path"]).as_posix(),
-                                    "method": method})
+        manifest["files"].append(
+            {key: row[key] for key in ("path", "relative_path", "size",
+                                     "hash", "sha256", "pair_id", "staged")}
+            | {"method": method})
     with (output / "manifest.json").open("x", encoding="utf-8") as file:
         json.dump(manifest, file, ensure_ascii=False, indent=2)
         file.write("\n")
         file.flush()
         os.fsync(file.fileno())
-    with (output / "manifest.csv").open("x", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("relative_path", "path", "staged", "size",
-                                                        "hash", "sha256", "pair_id", "method"))
-        writer.writeheader()
-        writer.writerows(manifest["files"])
-        handle.flush()
-        os.fsync(handle.fileno())
-    with db:
-        db.execute("INSERT INTO batches VALUES (?,?,?,?,?)",
-                   (batch_id, args.account, str(root), str(output), manifest["created_at"]))
-        for row in manifest["files"]:
-            db.execute("INSERT INTO batch_files (batch_id,source,staged,hash,size,pair_id) "
-                       "VALUES (?,?,?,?,?,?)", (batch_id, row["path"], row["staged"],
-                                                row["hash"], row["size"], row["pair_id"]))
-    print(f"Prepared {len(chosen)} files. Open {output / 'media'} in Ente Desktop.")
+    print(f"Prepared {len(planned)} files. Open {output / 'media'} in Ente Desktop.")
 
-
-def verify(db, args, current):
+def verify(args, current):
     manifest_path = args.manifest.expanduser().resolve(strict=True)
     with manifest_path.open(encoding="utf-8") as file:
         manifest = json.load(file)
@@ -546,20 +533,17 @@ def verify(db, args, current):
         matches = by_hash[row["hash"]]
         pair = groups.get(row.get("pair_id")) if row.get("pair_id") else None
         if pair and len(pair) == 2 and frozenset(r["hash"] for r in pair) in live_pairs:
-            status = "verified"  # Ente stores both components in one Live Photo item.
+            status = "verified"
         elif pair and len(pair) == 2:
             status = "needs_review" if matches else "not_found"
-        elif any(item.get("name") == Path(row["path"]).name for item in matches):
+        elif any(item.get("name") == Path(row.get("staged", row["path"])).name
+                 for item in matches):
             status = "verified"
         elif matches:
             status = "content_present_other_name"
         else:
             status = "not_found"
         results.append((row, status))
-    with db:
-        for row, status in results:
-            db.execute("UPDATE batch_files SET verified=? WHERE batch_id=? AND source=?",
-                       (status, manifest["batch_id"], row["path"]))
     counts = Counter(status for _, status in results)
     print(f"Verification: {len(files)} files")
     for status, n in sorted(counts.items()):
@@ -569,7 +553,6 @@ def verify(db, args, current):
             print(f"  {status}: {row['relative_path']}")
     print("Verification establishes current Ente content/name matches; it does not prove which upload added a file.")
     return 0 if counts.get("verified", 0) == len(files) else 1
-
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -594,9 +577,8 @@ def parser():
             mode.add_argument("--apply", action="store_true", help="Actually create a staging batch")
             mode.add_argument("--dry-run", action="store_true",
                               help="Preview only; leave staging and persistent SQLite unchanged (default)")
-            c.add_argument("--max-files", type=int, default=0)
-            c.add_argument("--max-bytes", type=parse_size, default=0)
-            c.add_argument("--include-staged", action="store_true")
+            c.add_argument("--flatten", action="store_true",
+                           help="Place all chosen files directly in media/")
     verify_cmd = commands.add_parser("verify-upload")
     verify_cmd.add_argument("manifest", type=Path)
     verify_cmd.add_argument("--allow-empty-remote", action="store_true")
@@ -610,12 +592,12 @@ def execute(db, args, root):
     import_download_history(db, args.camera_db.expanduser(), args.account)
     current, timestamp = refresh_history(db, args)
     if args.command == "verify-upload":
-        return verify(db, args, current)
+        return verify(args, current)
     rows = scan(db, args, root, current, timestamp)
     if args.command == "local-only":
         display(rows, root, args.format, args.output)
         return 0
-    prepare(db, args, root, rows, timestamp)
+    prepare(args, root, rows, timestamp)
     return 0
 
 
@@ -623,8 +605,6 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)  # SQLite, reports, lock and manifests may contain private file paths.
     try:
-        if args.command == "prepare-upload" and (args.max_files < 0 or args.max_bytes < 0):
-            raise PrepError("Batch limits cannot be negative")
         if args.command in ("local-only", "prepare-upload"):
             supplied_root = args.directory.expanduser()
             if supplied_root.is_symlink():
