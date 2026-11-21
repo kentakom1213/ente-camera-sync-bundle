@@ -572,7 +572,10 @@ def parser():
             c.add_argument("--output", type=Path)
         else:
             c.add_argument("--output", required=True, type=Path)
-            c.add_argument("--apply", action="store_true", help="Actually create a staging batch")
+            mode = c.add_mutually_exclusive_group()
+            mode.add_argument("--apply", action="store_true", help="Actually create a staging batch")
+            mode.add_argument("--dry-run", action="store_true",
+                              help="Preview only; leave staging and persistent SQLite unchanged (default)")
             c.add_argument("--max-files", type=int, default=0)
             c.add_argument("--max-bytes", type=parse_size, default=0)
             c.add_argument("--include-staged", action="store_true")
@@ -581,6 +584,21 @@ def parser():
     verify_cmd.add_argument("--allow-empty-remote", action="store_true")
     verify_cmd.add_argument("--allow-large-drop", action="store_true")
     return p
+
+
+def execute(db, args, root):
+    """Work against the supplied SQLite connection (persistent or in-memory)."""
+    init_db(db, args.account)
+    import_download_history(db, args.camera_db.expanduser(), args.account)
+    current, timestamp = refresh_history(db, args)
+    if args.command == "verify-upload":
+        return verify(db, args, current)
+    rows = scan(db, args, root, current, timestamp)
+    if args.command == "local-only":
+        display(rows, root, args.format, args.output)
+        return 0
+    prepare(db, args, root, rows, timestamp)
+    return 0
 
 
 def main(argv=None):
@@ -599,6 +617,17 @@ def main(argv=None):
         path = args.db.expanduser()
         if path.is_symlink():
             raise PrepError("Refusing symlinked upload database")
+        # A preview must not create or update the preparation DB or lock file.
+        # Clone a consistent snapshot into RAM; queries and refreshes can write
+        # to the in-memory copy without affecting persistent state.
+        if args.command == "prepare-upload" and not args.apply:
+            with closing(sqlite3.connect(":memory:")) as scratch:
+                if path.exists():
+                    if not path.is_file():
+                        raise PrepError("Upload database path is not a file")
+                    with closing(readonly_connection(path)) as source:
+                        source.backup(scratch)
+                return execute(scratch, args, root)
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_path = path.parent / ".ente-upload-prep.lock"
         if lock_path.is_symlink():
@@ -609,17 +638,7 @@ def main(argv=None):
             except BlockingIOError as exc:
                 raise PrepError("Another upload-preparation job is running") from exc
             with closing(sqlite3.connect(path)) as db:
-                init_db(db, args.account)
-                import_download_history(db, args.camera_db.expanduser(), args.account)
-                current, timestamp = refresh_history(db, args)
-                if args.command == "verify-upload":
-                    return verify(db, args, current)
-                rows = scan(db, args, root, current, timestamp)
-                if args.command == "local-only":
-                    display(rows, root, args.format, args.output)
-                    return 0
-                prepare(db, args, root, rows, timestamp)
-                return 0
+                return execute(db, args, root)
     except (PrepError, OSError, sqlite3.Error, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
