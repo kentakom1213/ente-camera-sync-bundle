@@ -60,6 +60,7 @@ class UploadPrepTest(unittest.TestCase):
                                           *extra, remote=remote)
         return rc, (json.loads(report_path.read_text()) if report_path.exists() else None), stderr
 
+
     def test_local_only_and_renamed_and_duplicates(self):
         self.file("Camera/present.jpg", b"same")
         self.file("Old/duplicate.jpg", b"same")
@@ -69,12 +70,15 @@ class UploadPrepTest(unittest.TestCase):
         self.file(".thumbnails/small.jpg", b"thumbnail")
         rc, doc, err = self.report(remote=[media(1, "remote.jpg", b"same")])
         self.assertEqual(rc, 0, err)
-        statuses = {r["relative_path"]: r["status"] for r in doc["files"]}
-        self.assertEqual(statuses["Camera/present.jpg"], "uploaded_renamed")
-        self.assertEqual(statuses["Old/duplicate.jpg"], "uploaded_renamed")
-        self.assertEqual(statuses["Old/only.jpg"], "local_duplicate")  # sorted copy before only
-        self.assertEqual(statuses["Old/copy.jpg"], "local_only")
-        self.assertEqual(len(statuses), 4)
+        rows = {r["relative_path"]: r for r in doc["files"]}
+        self.assertEqual(rows["Camera/present.jpg"]["status"], "uploaded")
+        self.assertTrue(rows["Camera/present.jpg"]["name_mismatch"])
+        self.assertEqual(rows["Old/duplicate.jpg"]["status"], "uploaded")
+        self.assertEqual(rows["Old/copy.jpg"]["status"], "local_only")
+        self.assertEqual(rows["Old/only.jpg"]["status"], "local_only")
+        self.assertEqual(rows["Old/only.jpg"]["duplicate_of"], "Old/copy.jpg")
+        self.assertIsNone(rows["Old/copy.jpg"]["duplicate_of"])
+        self.assertEqual(len(rows), 4)
         self.assertEqual(len(list(self.db.parent.glob("*.jpg"))), 0)
 
     def test_history_persists_after_deleted_remote_item(self):
@@ -125,6 +129,7 @@ class UploadPrepTest(unittest.TestCase):
         self.assertFalse(self.db.exists())
         self.assertFalse((self.base / ".ente-upload-prep.lock").exists())
 
+
     def test_implicit_dry_run_uses_snapshot_without_database_mutation(self):
         self.file("Original/a.jpg", b"photo A")
         first = self.base / "first"
@@ -140,7 +145,7 @@ class UploadPrepTest(unittest.TestCase):
             "--output", str(preview), remote=[])
         self.assertEqual(rc, 0, error)
         self.assertIn("New/b.jpg", output)
-        self.assertIn("Selected 1 files", output)
+        self.assertIn("Selected 2 files", output)  # No persistent batch suppression
         self.assertFalse(preview.exists())
         self.assertEqual(self.db.read_bytes(), original_db)
 
@@ -152,6 +157,7 @@ class UploadPrepTest(unittest.TestCase):
                 "--dry-run", "--apply",
             ])
         self.assertEqual(error.exception.code, 2)
+
 
     def test_batch_preserves_paths_and_recheck(self):
         src = self.file("Old/2021/leaf.jpg", b"private photo")
@@ -167,34 +173,161 @@ class UploadPrepTest(unittest.TestCase):
         self.assertNotEqual(src.stat().st_ino, staged.stat().st_ino)  # no hard links
         manifest = json.loads((stage / "manifest.json").read_text())
         self.assertEqual(len(manifest["files"]), 1)
+        self.assertFalse((stage / "manifest.csv").exists())
+        with sqlite3.connect(self.db) as conn:
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertFalse({"batches", "batch_files"} & tables)
+        # Preparing the same content in another destination is intentional.
         rc, _, _ = self.invoke("prepare-upload", str(self.pictures), "--output", str(self.base / "batch2"), "--apply")
-        self.assertEqual(rc, 2)  # all pending already staged
+        self.assertEqual(rc, 0)
         rc, _, _ = self.invoke("verify-upload", str(stage / "manifest.json"), remote=[])
         self.assertEqual(rc, 1)
         rc, text, _ = self.invoke("verify-upload", str(stage / "manifest.json"),
                                   remote=[media(2, "leaf.jpg", b"private photo")])
         self.assertEqual(rc, 0)
         self.assertIn("verified: 1", text)
-        with sqlite3.connect(self.db) as conn:
-            self.assertEqual(conn.execute("SELECT verified FROM batch_files").fetchone()[0], "verified")
 
-    def test_livephoto_pair_not_split_by_limit_and_verified_as_composite(self):
+
+    def test_livephoto_pair_staged_and_verified_as_composite(self):
         self.file("Camera/IMG_3.HEIC", b"photo")
         self.file("Camera/IMG_3.MOV", b"movie")
         stage = self.base / "one"
-        rc, output, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage),
-                                      "--max-files", "1", "--apply", remote=[])
-        self.assertEqual(rc, 2, output + err)  # pair counts as two files
-        self.assertFalse(stage.exists())
-        rc, output, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage),
-                                      "--max-files", "2", "--apply")
-        self.assertEqual(rc, 0, err)
+        rc, output, err = self.invoke("prepare-upload", str(self.pictures),
+                                      "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, output + err)
         self.assertEqual(len(list((stage / "media").rglob("*.*"))), 2)
         live = {"id": "4", "name": "IMG_3.HEIC", "type": "livephoto",
                 "hash": digest(b"photo") + ":" + digest(b"movie")}
         rc, text, err = self.invoke("verify-upload", str(stage / "manifest.json"), remote=[live])
         self.assertEqual(rc, 0, text + err)
         self.assertIn("verified: 2", text)
+
+
+    def test_flatten_colliding_names_are_both_renamed_and_verifiable(self):
+        self.file("Camera/photo.jpg", b"one")
+        self.file("Old/photo.jpg", b"two")
+        self.file("Screenshots/unique.png", b"three")
+        stage = self.base / "flat"
+        rc, preview, err = self.invoke("prepare-upload", str(self.pictures),
+                                       "--flatten", "--output", str(stage), "--dry-run", remote=[])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Selected 3 files", preview)
+        self.assertFalse(stage.exists())
+        rc, _, err = self.invoke("prepare-upload", str(self.pictures),
+                                 "--flatten", "--output", str(stage), "--apply")
+        self.assertEqual(rc, 0, err)
+        doc = json.loads((stage / "manifest.json").read_text())
+        names = {row["relative_path"]: Path(row["staged"]).name for row in doc["files"]}
+        self.assertTrue(names["Camera/photo.jpg"].startswith("photo__"))
+        self.assertTrue(names["Old/photo.jpg"].startswith("photo__"))
+        self.assertNotEqual(names["Camera/photo.jpg"], names["Old/photo.jpg"])
+        self.assertEqual(names["Screenshots/unique.png"], "unique.png")
+        self.assertFalse((stage / "media/photo.jpg").exists())
+        remote = [media(1, names["Camera/photo.jpg"], b"one"),
+                  media(2, names["Old/photo.jpg"], b"two"),
+                  media(3, "unique.png", b"three")]
+        rc, result, err = self.invoke("verify-upload", str(stage / "manifest.json"), remote=remote)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("verified: 3", result)
+
+    def test_flatten_case_and_unicode_normalization_collisions(self):
+        self.file("A/Photo.JPG", b"upper")
+        self.file("B/photo.jpg", b"lower")
+        self.file("C/café.jpg", b"nfc")
+        self.file("D/cafe\u0301.jpg", b"nfd")
+        stage = self.base / "flat"
+        rc, _, err = self.invoke("prepare-upload", str(self.pictures),
+                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, err)
+        paths = [p.name for p in (stage / "media").iterdir()]
+        self.assertEqual(len(paths), 4)
+        self.assertEqual(len({prep.normalized_name(name) for name in paths}), 4)
+        self.assertTrue(all("__" in name for name in paths))
+
+    def test_flatten_generated_suffix_collision(self):
+        from hashlib import sha256
+        self.file("A/photo.jpg", b"first")
+        self.file("B/photo.jpg", b"second")
+        generated_name = f"photo__{sha256(b'first').hexdigest()[:8]}.jpg"
+        self.file("C/" + generated_name, b"third")
+        stage = self.base / "flat"
+        rc, _, err = self.invoke("prepare-upload", str(self.pictures),
+                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, err)
+        doc = json.loads((stage / "manifest.json").read_text())
+        names = [Path(row["staged"]).name for row in doc["files"]]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(len(names), 3)
+        self.assertNotIn(generated_name, names)
+
+    def test_flatten_live_photo_pair_keeps_matching_suffix(self):
+        self.file("A/IMG_1.HEIC", b"image A")
+        self.file("A/IMG_1.MOV", b"video A")
+        self.file("B/IMG_1.HEIC", b"image B")
+        self.file("B/IMG_1.MOV", b"video B")
+        stage = self.base / "flat"
+        rc, _, err = self.invoke("prepare-upload", str(self.pictures),
+                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, err)
+        doc = json.loads((stage / "manifest.json").read_text())
+        by_parent = {}
+        for row in doc["files"]:
+            by_parent.setdefault(Path(row["relative_path"]).parts[0], []).append(Path(row["staged"]).name)
+        self.assertEqual(set(by_parent), {"A", "B"})
+        for filenames in by_parent.values():
+            self.assertEqual(len(filenames), 2)
+            stems = {Path(name).stem for name in filenames}
+            self.assertEqual(len(stems), 1)
+            self.assertIn("__", next(iter(stems)))
+        remote = [
+            {"id": "11", "name": "IMG_1.HEIC", "type": "livephoto",
+             "hash": digest(b"image A") + ":" + digest(b"video A")},
+            {"id": "12", "name": "IMG_1.HEIC", "type": "livephoto",
+             "hash": digest(b"image B") + ":" + digest(b"video B")},
+        ]
+        rc, text, err = self.invoke("verify-upload", str(stage / "manifest.json"), remote=remote)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("verified: 4", text)
+
+    def test_flatten_skips_local_duplicates(self):
+        self.file("A/one.jpg", b"same")
+        self.file("B/two.jpg", b"same")
+        stage = self.base / "flat"
+        rc, output, err = self.invoke("prepare-upload", str(self.pictures),
+                                      "--flatten", "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Selected 1 files", output)
+        self.assertEqual(len(list((stage / "media").iterdir())), 1)
+
+    def test_legacy_batch_tables_are_ignored_without_deleting_old_data(self):
+        self.file("A/photo.jpg", b"photo")
+        self.assertEqual(self.report(remote=[])[0], 0)
+        with sqlite3.connect(self.db) as db:
+            db.execute("CREATE TABLE batches(batch_id TEXT)")
+            db.execute("INSERT INTO batches VALUES ('old')")
+            db.execute("CREATE TABLE batch_files(batch_id TEXT, hash TEXT)")
+            db.execute("INSERT INTO batch_files VALUES ('old', ?)", (digest(b"photo"),))
+        stage = self.base / "stage"
+        rc, _, err = self.invoke("prepare-upload", str(self.pictures),
+                                 "--output", str(stage), "--apply", remote=[])
+        self.assertEqual(rc, 0, err)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM batches").fetchone()[0], 1)
+        self.assertTrue((stage / "media/A/photo.jpg").exists())
+
+    def test_removed_limit_and_batch_options_are_rejected(self):
+        for option, value in (("--max-files", "3"), ("--max-bytes", "5GiB"),
+                              ("--include-staged", None)):
+            args = ["--account", "test", "prepare-upload", str(self.pictures),
+                    "--output", str(self.base / "stage"), option]
+            if value is not None:
+                args.append(value)
+            with self.subTest(option=option), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    prep.parser().parse_args(args)
+                self.assertEqual(error.exception.code, 2)
+
 
     def test_partial_livephoto_is_review_not_staged(self):
         self.file("IMG_3.HEIC", b"photo")
