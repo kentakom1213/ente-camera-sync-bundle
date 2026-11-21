@@ -3,7 +3,7 @@ name: Python tests
 on:
   pull_request:
   push:
-    branches: [feat/ente-desktop-upload-preparation-20261121]
+    branches: [main]
 
 jobs:
   test:
