@@ -97,7 +97,17 @@ python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
 ```
 
 `prepare-upload` は通常，ステージングを作成します．`--dry-run` を指定した場合だけ事前確認になります．
-`--dry-run` は対象件数・総容量・出力先の一部を表示し，ステージングと永続 SQLite を変更しません．
+`prepare-upload` は対象ファイルの総数・総容量・出力先を表示します（ファイル名の一覧は表示しません）．
+`--dry-run` ではその集計だけを確認し，ステージングと永続 SQLite を変更しません．
+出力例：
+
+```text
+Files: 1,234
+Total size: 5.67 GiB
+Destination: /home/user/share/ente-upload/batch-001
+Dry run: staging not created.
+```
+
 既存 SQLite があればメモリ上に複製して判定します．
 Ente CLI 自身のメタデータキャッシュは更新される場合があります．
 `--dry-run` を外すとステージングが実行されます．旧 `--apply` は使用できません．
