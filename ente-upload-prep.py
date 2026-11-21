@@ -513,7 +513,85 @@ def plan(rows, flatten):
                 raise PrepError("Cannot resolve flattened filename collision")
     return [dict(row, staged=staged_paths[row["relative_path"]]) for row in selected]
 
-def safe_replicate(source, dest, expected):
+
+class StageProgress:
+    """Report logical staged bytes; reflinks share data without copying it."""
+
+    def __init__(self, total_files, total_bytes):
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.done_files = 0
+        self.done_bytes = 0
+        self.current_bytes = 0
+        self.reflinks = 0
+        self.copies = 0
+        self.phase = ""
+        self.tty = sys.stderr.isatty()
+        self.last_update = 0.0
+        self.last_width = 0
+
+    def start(self):
+        self.current_bytes = 0
+        self.phase = "linking"
+        self.render(force=True)
+
+    def copied(self, size):
+        self.current_bytes += size
+        self.phase = "copying"
+        self.render()
+
+    def verifying(self):
+        self.phase = "verifying"
+        self.render(force=True)
+
+    def finish(self, size, method):
+        self.done_files += 1
+        self.done_bytes += size
+        self.current_bytes = 0
+        if method == "reflink":
+            self.reflinks += 1
+        else:
+            self.copies += 1
+        self.phase = ""
+        self.render(force=True)
+
+    def summary(self):
+        return (f"{self.done_files}/{self.total_files} files, "
+                f"{human_size(self.done_bytes + self.current_bytes)} / "
+                f"{human_size(self.total_bytes)}, "
+                f"{self.reflinks} reflink, {self.copies} copy")
+
+    def render(self, force=False):
+        if not self.tty:
+            return
+        current_time = time.monotonic()
+        if not force and current_time - self.last_update < 0.1:
+            return
+        self.last_update = current_time
+        if self.total_bytes:
+            fraction = min(1.0, (self.done_bytes + self.current_bytes) / self.total_bytes)
+        else:
+            fraction = self.done_files / self.total_files if self.total_files else 1.0
+        if self.done_files < self.total_files:
+            fraction = min(fraction, 0.99)
+        filled = int(20 * fraction)
+        line = (f"Staging [{'#' * filled}{'-' * (20 - filled)}] "
+                f"{self.summary()}")
+        if self.phase:
+            line += f" ({self.phase})"
+        sys.stderr.write("\r" + line + " " * max(0, self.last_width - len(line)))
+        sys.stderr.flush()
+        self.last_width = len(line)
+
+    def close(self):
+        if self.tty:
+            self.render(force=True)
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            print(f"Staging: {self.summary()}", file=sys.stderr)
+
+def safe_replicate(source, dest, expected, on_copy_bytes=None, on_verifying=None):
     before = source.lstat()
     if source.is_symlink():
         raise PrepError(f"Refusing source symlink: {source}")
@@ -525,10 +603,15 @@ def safe_replicate(source, dest, expected):
             out.seek(0)
             out.truncate(0)
             inp.seek(0)
-            shutil.copyfileobj(inp, out, CHUNK)
+            while buf := inp.read(CHUNK):
+                out.write(buf)
+                if on_copy_bytes is not None:
+                    on_copy_bytes(len(buf))
             method = "copy"
         out.flush()
         os.fsync(out.fileno())
+    if on_verifying is not None:
+        on_verifying()
     after = source.lstat()
     attrs = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
     if any(getattr(before, attr) != getattr(after, attr) for attr in attrs):
@@ -575,14 +658,22 @@ def prepare(args, root, rows, timestamp):
     manifest = {"format_version": 1, "account": args.account, "source_root": str(root),
                 "created_at": now(), "remote_snapshot_at": timestamp,
                 "flatten": args.flatten, "files": []}
-    for row in planned:
-        target = output / row["staged"]
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        method = safe_replicate(Path(row["path"]), target, row)
-        manifest["files"].append(
-            {key: row[key] for key in ("path", "relative_path", "size",
-                                     "hash", "sha256", "pair_id", "staged")}
-            | {"method": method})
+    progress = StageProgress(len(planned), total)
+    try:
+        for row in planned:
+            target = output / row["staged"]
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            progress.start()
+            method = safe_replicate(Path(row["path"]), target, row,
+                                    on_copy_bytes=progress.copied,
+                                    on_verifying=progress.verifying)
+            manifest["files"].append(
+                {key: row[key] for key in ("path", "relative_path", "size",
+                                         "hash", "sha256", "pair_id", "staged")}
+                | {"method": method})
+            progress.finish(row["size"], method)
+    finally:
+        progress.close()
     with (output / "manifest.json").open("x", encoding="utf-8") as file:
         json.dump(manifest, file, ensure_ascii=False, indent=2)
         file.write("\n")
