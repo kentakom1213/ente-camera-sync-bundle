@@ -88,14 +88,14 @@ python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
 # 計画を確認したら，実際に作成
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
   prepare-upload ~/Pictures --flatten \
-  --output ~/share/ente-upload/batch-001 --apply
+  --output ~/share/ente-upload/batch-001
 ```
 
-`prepare-upload` は **`--dry-run` が既定**で，明示的に指定することもできます．
+`prepare-upload` は通常，ステージングを作成します．`--dry-run` を指定した場合だけ事前確認になります．
 `--dry-run` は対象件数・総容量・出力先の一部を表示し，ステージングと永続 SQLite を変更しません．
 既存 SQLite があればメモリ上に複製して判定します．
 Ente CLI 自身のメタデータキャッシュは更新される場合があります．
-`--dry-run` と `--apply` は併用できません．
+`--dry-run` を外すとステージングが実行されます．旧 `--apply` は使用できません．
 
 **すべての未アップロード候補が対象**です．件数・容量による途中選択は行いません．
 ステージング対象が大量になる場合は，コピーに必要な容量を確認し，
