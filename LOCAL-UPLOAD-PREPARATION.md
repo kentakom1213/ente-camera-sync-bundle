@@ -41,12 +41,14 @@ python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
 
 | `status` | 意味 | ステージング対象 |
 | --- | --- | --- |
-| `uploaded` | 現在 Ente に同じ内容・同じファイル名がある | いいえ |
-| `uploaded_renamed` | 同じ内容があるがファイル名が違う | いいえ |
+| `uploaded` | 現在 Ente に同じ内容がある | いいえ |
 | `previously_seen` | 過去に Ente に存在した記録があるが現在の一覧にはない | いいえ |
-| `local_only` | 現在・過去に同一ハッシュを確認できない | はい |
-| `local_duplicate` | ローカルで同じ内容を持つ別の代表ファイルがある | いいえ |
+| `local_only` | 現在・過去に同一ハッシュを確認できない | はい（重複以外） |
 | `needs_review` | Live Photo のペアが曖昧，または部分一致している | いいえ |
+
+ファイル名だけが違う `uploaded` は `name_mismatch=true` として報告します．
+ローカルの同一内容の重複は `local_only` のまま `duplicate_of` に代表ファイルのパスを保持します．
+ステージングするのは `duplicate_of` が空の候補だけです．
 
 判定は **BLAKE2b-512 の内容一致**に基づきます．再エンコードした画像，編集した画像は
 別内容と判定されます．また，`local_only` は「このツールが確認できた Ente メタデータに
@@ -70,58 +72,65 @@ Ente の最新一覧の取得に失敗した場合，結果を確定しません
 ## 2. Desktop 用ディレクトリの準備
 
 ```zsh
-# ステージングを ~/Pictures の外に用意する
+# ステージングは ~/Pictures の外の新しいディレクトリに作成
 mkdir -p ~/share/ente-upload
 
-# 事前確認：ファイル数・容量の上限を指定
+# 元の階層を維持して，対象ファイルすべての計画を確認
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
   prepare-upload ~/Pictures \
-  --max-files 300 --max-bytes 5GiB \
   --output ~/share/ente-upload/batch-001 --dry-run
 
-# 確認後に明示的に作成
+# 必要なら階層をなくしてフラットに配置
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
-  prepare-upload ~/Pictures \
-  --max-files 300 --max-bytes 5GiB \
+  prepare-upload ~/Pictures --flatten \
+  --output ~/share/ente-upload/batch-001 --dry-run
+
+# 計画を確認したら，実際に作成
+python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
+  prepare-upload ~/Pictures --flatten \
   --output ~/share/ente-upload/batch-001 --apply
 ```
 
 `prepare-upload` は **`--dry-run` が既定**で，明示的に指定することもできます．
-`--dry-run` では対象件数・容量・ファイル名を表示するのみで，ステージング，
-アップロード準備用の SQLite，ロックファイルを新規作成・更新しません．
-既存の SQLite があればメモリ上のスナップショットを使って候補を選びます．
-Ente CLI がオンライン一覧の取得時に自身のメタデータキャッシュを更新することはあります．
+`--dry-run` は対象件数・総容量・出力先の一部を表示し，ステージングと永続 SQLite を変更しません．
+既存 SQLite があればメモリ上に複製して判定します．
+Ente CLI 自身のメタデータキャッシュは更新される場合があります．
 `--dry-run` と `--apply` は併用できません．
-ステージング先は**新しいディレクトリでなければなりません**．上書きも自動削除もしません．
-現在の対象とステージング済みのバッチに含まれる内容を照合し，対象候補を決定します．
-すでに準備したものを再度準備したい場合に限り `--include-staged` を明示します．
 
-出力例：
+**すべての未アップロード候補が対象**です．件数・容量による途中選択は行いません．
+ステージング対象が大量になる場合は，コピーに必要な容量を確認し，
+必要なら入力ディレクトリを分けて実行してください．
 
 ```text
 ~/share/ente-upload/batch-001/
 ├── manifest.json
-├── manifest.csv
 └── media/
-    ├── Camera/2020/01/IMG_1234.jpg
-    └── OldPhotos/2015/IMG_5678.heic
+    ├── IMG_1234__a3f8c2d1.jpg
+    ├── IMG_1234__b9a1ef03.jpg
+    └── IMG_5678.heic
 ```
 
-`media/` 以下は**指定元からの相対ディレクトリ構造とファイル名を維持**します．
+標準では `media/` 以下に入力元の相対ディレクトリ構造を保持します．
+`--flatten` では `media/` 直下にすべて配置します．同名（大文字小文字・Unicode NFC の差を含む）が
+重複するときは，**衝突する全ファイル**に内容由来の短い SHA-256 接尾辞を追加します．
+接尾辞がさらに衝突すれば桁数を増やします．Live Photo の静止画と動画には同じ接尾辞を付けます．
+元のパスと変更後の名前は `manifest.json` に保存し，`verify-upload` は実際に使用した名前で検証します．
 
-- Linux `FICLONE` による Reflink を試し，使用できなければ通常 Copy に切り替えます．
-  **Hardlink は使用しません**．
+- Linux `FICLONE` による Reflink を試し，利用できなければ通常 Copy に切り替えます．Hardlink は使用しません．
 - ステージングした内容を元データの SHA-256 と BLAKE2b-512 に照合し，変更があれば中止します．
-- Live Photo と推定した `.HEIC` / `.JPG` + `.MOV` のペアは分割せず，同じ場所に配置します．
-  ペアが曖昧・部分一致の場合は自動ステージングしません．
-- ステージング先が入力ディレクトリの内側の場合は拒否します．
-- 書き込みエラーなどで途中停止した場合，作成途中のディレクトリは**自動削除しません**．
-  `manifest.json` の存在を確認し，必要なら手動で状態を確認してください．
+- Live Photo のペアが曖昧，または片方だけが Ente にある場合は自動ステージングしません．
+- ステージングは新しいディレクトリに限り，既存のものを上書き・削除しません．
+- ステージング先が入力ディレクトリの内側，または入力ディレクトリを包含する場合は拒否します．
+- 途中で失敗した場合，作成途中のディレクトリは自動削除しません．内容と `manifest.json` の有無を手動確認してください．
+
+複数回のステージングで同じ内容を選択することも可能です．
+SQLite で作成済みバッチを追跡・自動除外する処理はありません．
+既存 DB に古い `batches` / `batch_files` テーブルがあっても利用せず，データを勝手に削除しません．
 
 ## 3. Ente Desktop からアップロード
 
 Ente Desktop で `batch-001/media` を選択して手動アップロードします．
-`batch-001` 全体を選択すると `manifest.json` と `manifest.csv` まで含まれる可能性があるため，
+`batch-001` 全体を選択すると `manifest.json` まで含まれる可能性があるため，
 **必ず `media` だけを選択**してください．アルバム構成は Desktop 側で確認してください．
 
 **Watch Folder には登録しないでください．** ステージングを整理した際に Ente 側の
@@ -147,11 +156,11 @@ Live Photo は静止画と動画の両ハッシュを持つ1件の Live Photo �
 ```text
 ~/.local/state/ente-camera-sync/
 ├── state-v04.sqlite3           # 既存 Camera バックアップ用（読み取り専用参照）
-└── upload-preparation.sqlite3  # 今回のスキャンキャッシュ・Ente 履歴・バッチ
+└── upload-preparation.sqlite3  # スキャンキャッシュ・Ente 履歴
 ```
 
-写真・動画の実体は専用 SQLite に保存しません．パス・ハッシュ・Ente ファイル ID と
-ステージング履歴だけを保存します．アカウントを混同しないよう DB 内に固定します．
+写真・動画の実体は専用 SQLite に保存しません．パス・ハッシュ・Ente ファイル ID・
+最終確認日時だけを保存します．アカウントを混同しないよう DB 内に固定します．
 
 本ツールが触る Ente 側 API は **ファイル一覧取得のみ**です．
 `ente-camera-sync-v04.py` の自動実行，ダウンロード先，既存 SQLite スキーマを変更しません．
