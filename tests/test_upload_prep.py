@@ -130,31 +130,31 @@ class UploadPrepTest(unittest.TestCase):
         self.assertFalse((self.base / ".ente-upload-prep.lock").exists())
 
 
-    def test_implicit_dry_run_uses_snapshot_without_database_mutation(self):
+    def test_explicit_dry_run_uses_snapshot_without_database_mutation(self):
         self.file("Original/a.jpg", b"photo A")
         first = self.base / "first"
         rc, _, error = self.invoke(
             "prepare-upload", str(self.pictures),
-            "--output", str(first), "--apply", remote=[])
+            "--output", str(first), remote=[])
         self.assertEqual(rc, 0, error)
         original_db = self.db.read_bytes()
         self.file("New/b.jpg", b"photo B")
         preview = self.base / "second"
         rc, output, error = self.invoke(
             "prepare-upload", str(self.pictures),
-            "--output", str(preview), remote=[])
+            "--output", str(preview), "--dry-run", remote=[])
         self.assertEqual(rc, 0, error)
         self.assertIn("New/b.jpg", output)
         self.assertIn("Selected 2 files", output)  # No persistent batch suppression
         self.assertFalse(preview.exists())
         self.assertEqual(self.db.read_bytes(), original_db)
 
-    def test_dry_run_and_apply_options_are_mutually_exclusive(self):
+    def test_apply_option_is_removed(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
             prep.parser().parse_args([
                 "--account", "test", "prepare-upload", str(self.pictures),
                 "--output", str(self.base / "batch"),
-                "--dry-run", "--apply",
+                "--apply",
             ])
         self.assertEqual(error.exception.code, 2)
 
@@ -162,10 +162,10 @@ class UploadPrepTest(unittest.TestCase):
     def test_batch_preserves_paths_and_recheck(self):
         src = self.file("Old/2021/leaf.jpg", b"private photo")
         stage = self.base / "stage"
-        rc, text, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage), remote=[])
+        rc, text, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage), "--dry-run", remote=[])
         self.assertEqual(rc, 0, err)
         self.assertFalse(stage.exists())
-        rc, text, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage), "--apply")
+        rc, text, err = self.invoke("prepare-upload", str(self.pictures), "--output", str(stage))
         self.assertEqual(rc, 0, err)
         staged = stage / "media/Old/2021/leaf.jpg"
         self.assertEqual(staged.read_bytes(), b"private photo")
@@ -179,7 +179,7 @@ class UploadPrepTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertFalse({"batches", "batch_files"} & tables)
         # Preparing the same content in another destination is intentional.
-        rc, _, _ = self.invoke("prepare-upload", str(self.pictures), "--output", str(self.base / "batch2"), "--apply")
+        rc, _, _ = self.invoke("prepare-upload", str(self.pictures), "--output", str(self.base / "batch2"))
         self.assertEqual(rc, 0)
         rc, _, _ = self.invoke("verify-upload", str(stage / "manifest.json"), remote=[])
         self.assertEqual(rc, 1)
@@ -194,7 +194,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("Camera/IMG_3.MOV", b"movie")
         stage = self.base / "one"
         rc, output, err = self.invoke("prepare-upload", str(self.pictures),
-                                      "--output", str(stage), "--apply", remote=[])
+                                      "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, output + err)
         self.assertEqual(len(list((stage / "media").rglob("*.*"))), 2)
         live = {"id": "4", "name": "IMG_3.HEIC", "type": "livephoto",
@@ -215,7 +215,7 @@ class UploadPrepTest(unittest.TestCase):
         self.assertIn("Selected 3 files", preview)
         self.assertFalse(stage.exists())
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
-                                 "--flatten", "--output", str(stage), "--apply")
+                                 "--flatten", "--output", str(stage))
         self.assertEqual(rc, 0, err)
         doc = json.loads((stage / "manifest.json").read_text())
         names = {row["relative_path"]: Path(row["staged"]).name for row in doc["files"]}
@@ -238,7 +238,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("D/cafe\u0301.jpg", b"nfd")
         stage = self.base / "flat"
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
-                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+                                 "--flatten", "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
         paths = [p.name for p in (stage / "media").iterdir()]
         self.assertEqual(len(paths), 4)
@@ -253,7 +253,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("C/" + generated_name, b"third")
         stage = self.base / "flat"
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
-                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+                                 "--flatten", "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
         doc = json.loads((stage / "manifest.json").read_text())
         names = [Path(row["staged"]).name for row in doc["files"]]
@@ -268,7 +268,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("B/IMG_1.MOV", b"video B")
         stage = self.base / "flat"
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
-                                 "--flatten", "--output", str(stage), "--apply", remote=[])
+                                 "--flatten", "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
         doc = json.loads((stage / "manifest.json").read_text())
         by_parent = {}
@@ -295,7 +295,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("B/two.jpg", b"same")
         stage = self.base / "flat"
         rc, output, err = self.invoke("prepare-upload", str(self.pictures),
-                                      "--flatten", "--output", str(stage), "--apply", remote=[])
+                                      "--flatten", "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
         self.assertIn("Selected 1 files", output)
         self.assertEqual(len(list((stage / "media").iterdir())), 1)
@@ -310,7 +310,7 @@ class UploadPrepTest(unittest.TestCase):
             db.execute("INSERT INTO batch_files VALUES ('old', ?)", (digest(b"photo"),))
         stage = self.base / "stage"
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
-                                 "--output", str(stage), "--apply", remote=[])
+                                 "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
         with sqlite3.connect(self.db) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM batches").fetchone()[0], 1)
@@ -369,7 +369,7 @@ class UploadPrepTest(unittest.TestCase):
         target = self.base / "staging"
         with patch.object(prep.fcntl, "ioctl", side_effect=OSError(errno.EOPNOTSUPP, "not supported")):
             rc, output, err = self.invoke("prepare-upload", str(self.pictures),
-                                          "--output", str(target), "--apply", remote=[])
+                                          "--output", str(target), remote=[])
         self.assertEqual(rc, 0, err)
         manifest = json.loads((target / "manifest.json").read_text())
         self.assertEqual(manifest["files"][0]["method"], "copy")
@@ -400,7 +400,7 @@ class UploadPrepTest(unittest.TestCase):
         self.file("photo.jpg", b"photo")
         nested = self.pictures / "staging"
         rc, output, err = self.invoke("prepare-upload", str(self.pictures),
-                                      "--output", str(nested), "--apply", remote=[])
+                                      "--output", str(nested), remote=[])
         self.assertEqual(rc, 2)
         self.assertFalse(nested.exists())
         self.assertIn("outside", err)
