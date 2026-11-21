@@ -77,7 +77,7 @@ mkdir -p ~/share/ente-upload
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
   prepare-upload ~/Pictures \
   --max-files 300 --max-bytes 5GiB \
-  --output ~/share/ente-upload/batch-001
+  --output ~/share/ente-upload/batch-001 --dry-run
 
 # 確認後に明示的に作成
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
@@ -86,6 +86,12 @@ python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
   --output ~/share/ente-upload/batch-001 --apply
 ```
 
+`prepare-upload` は **`--dry-run` が既定**で，明示的に指定することもできます．
+`--dry-run` では対象件数・容量・ファイル名を表示するのみで，ステージング，
+アップロード準備用の SQLite，ロックファイルを新規作成・更新しません．
+既存の SQLite があればメモリ上のスナップショットを使って候補を選びます．
+Ente CLI がオンライン一覧の取得時に自身のメタデータキャッシュを更新することはあります．
+`--dry-run` と `--apply` は併用できません．
 ステージング先は**新しいディレクトリでなければなりません**．上書きも自動削除もしません．
 現在の対象とステージング済みのバッチに含まれる内容を照合し，対象候補を決定します．
 すでに準備したものを再度準備したい場合に限り `--include-staged` を明示します．
