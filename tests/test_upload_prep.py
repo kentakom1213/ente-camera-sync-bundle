@@ -156,7 +156,7 @@ class UploadPrepTest(unittest.TestCase):
             "--output", str(stage), "--dry-run", remote=[])
         self.assertEqual(rc, 0, error)
         self.assertIn("Dry run", output)
-        self.assertIn("Selected 1 files", output)
+        self.assertIn("Files: 1", output)
         self.assertFalse(stage.exists())
         self.assertFalse(self.db.exists())
         self.assertFalse((self.base / ".ente-upload-prep.lock").exists())
@@ -176,10 +176,43 @@ class UploadPrepTest(unittest.TestCase):
             "prepare-upload", str(self.pictures),
             "--output", str(preview), "--dry-run", remote=[])
         self.assertEqual(rc, 0, error)
-        self.assertIn("New/b.jpg", output)
-        self.assertIn("Selected 2 files", output)  # No persistent batch suppression
+        self.assertNotIn("New/b.jpg", output)
+        self.assertIn("Files: 2", output)  # No persistent batch suppression
         self.assertFalse(preview.exists())
         self.assertEqual(self.db.read_bytes(), original_db)
+
+    def test_prepare_displays_only_file_count_and_total_size(self):
+        self.file("Camera/first.jpg", b"a" * 2048)
+        self.file("Old/second.jpg", b"b" * 1024)
+        self.file("Uploaded/already.jpg", b"remote")
+        remote = [media(1, "already.jpg", b"remote")]
+        stage = self.base / "summary"
+        rc, preview, err = self.invoke(
+            "prepare-upload", str(self.pictures),
+            "--flatten", "--output", str(stage), "--dry-run", remote=remote)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Files: 2", preview)
+        self.assertIn("Total size: 3.00 KiB", preview)
+        for filename in ("first.jpg", "second.jpg", "already.jpg"):
+            self.assertNotIn(filename, preview)
+        self.assertFalse(stage.exists())
+        rc, applied, err = self.invoke(
+            "prepare-upload", str(self.pictures),
+            "--flatten", "--output", str(stage), remote=remote)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Files: 2", applied)
+        self.assertIn("Total size: 3.00 KiB", applied)
+        self.assertNotIn("first.jpg", applied)
+        self.assertNotIn("second.jpg", applied)
+        self.assertEqual(len(list((stage / "media").iterdir())), 2)
+
+    def test_human_size_binary_units(self):
+        self.assertEqual(prep.human_size(0), "0 B")
+        self.assertEqual(prep.human_size(1_023), "1,023 B")
+        self.assertEqual(prep.human_size(1_024), "1.00 KiB")
+        self.assertEqual(prep.human_size(1024 ** 2), "1.00 MiB")
+        self.assertEqual(prep.human_size(1024 ** 3), "1.00 GiB")
+        self.assertEqual(prep.human_size(1024 ** 4), "1.00 TiB")
 
     def test_apply_option_is_removed(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -244,7 +277,7 @@ class UploadPrepTest(unittest.TestCase):
         rc, preview, err = self.invoke("prepare-upload", str(self.pictures),
                                        "--flatten", "--output", str(stage), "--dry-run", remote=[])
         self.assertEqual(rc, 0, err)
-        self.assertIn("Selected 3 files", preview)
+        self.assertIn("Files: 3", preview)
         self.assertFalse(stage.exists())
         rc, _, err = self.invoke("prepare-upload", str(self.pictures),
                                  "--flatten", "--output", str(stage))
@@ -329,7 +362,7 @@ class UploadPrepTest(unittest.TestCase):
         rc, output, err = self.invoke("prepare-upload", str(self.pictures),
                                       "--flatten", "--output", str(stage), remote=[])
         self.assertEqual(rc, 0, err)
-        self.assertIn("Selected 1 files", output)
+        self.assertIn("Files: 1", output)
         self.assertEqual(len(list((stage / "media").iterdir())), 1)
 
     def test_legacy_batch_tables_are_ignored_without_deleting_old_data(self):
