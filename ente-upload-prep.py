@@ -194,13 +194,13 @@ def refresh_history(db, args):
 
 
 def hash_file(path):
-    first = path.stat(follow_symlinks=False)
+    first = path.lstat()
     sha, b2 = hashlib.sha256(), hashlib.blake2b(digest_size=64)
     with path.open("rb") as file:
         while buf := file.read(CHUNK):
             sha.update(buf)
             b2.update(buf)
-    second = path.stat(follow_symlinks=False)
+    second = path.lstat()
     attrs = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
     if path.is_symlink() or any(getattr(first, a) != getattr(second, a) for a in attrs):
         raise PrepError(f"File changed while hashing: {path}")
@@ -250,7 +250,7 @@ def scan(db, args, root, current, timestamp):
     camera = indexed_camera(args.camera_db, args.account)
     rows = []
     for path, kind in scan_paths(root, args.exclude):
-        stat = path.stat(follow_symlinks=False)
+        stat = path.lstat()
         cache = db.execute("SELECT size,mtime_ns,ctime_ns,dev,inode,sha256,blake2b "
                            "FROM scan_files WHERE path=?", (str(path),)).fetchone()
         unchanged = cache and (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
@@ -420,7 +420,7 @@ def select_batch(rows, db, args):
 
 
 def safe_replicate(source, dest, expected):
-    before = source.stat(follow_symlinks=False)
+    before = source.lstat()
     if source.is_symlink():
         raise PrepError(f"Refusing source symlink: {source}")
     with source.open("rb") as inp, dest.open("xb") as out:
@@ -435,7 +435,7 @@ def safe_replicate(source, dest, expected):
             method = "copy"
         out.flush()
         os.fsync(out.fileno())
-    after = source.stat(follow_symlinks=False)
+    after = source.lstat()
     attrs = ("st_size", "st_mtime_ns", "st_ctime_ns", "st_ino", "st_dev")
     if any(getattr(before, attr) != getattr(after, attr) for attr in attrs):
         raise PrepError(f"Source changed during staging: {source}")
