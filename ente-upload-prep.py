@@ -383,33 +383,59 @@ def display(rows, root, fmt, output):
     else:
         print(content, end="")
 
-def parse_size(value):
-    match = re.fullmatch(r"(\d+)(B|KiB|MiB|GiB)?", value, re.IGNORECASE)
-    if not match:
-        raise argparse.ArgumentTypeError("Size must be like 5GiB or 1024MiB")
-    return int(match.group(1)) * 1024 ** {"b": 0, "kib": 1, "mib": 2, "gib": 3}[((match.group(2) or "B").lower())]
+def normalized_name(name):
+    """Compare output names across case-insensitive and Unicode filesystems."""
+    return unicodedata.normalize("NFC", name).casefold()
 
 
-def select_batch(rows, db, args):
-    prepared = set() if args.include_staged else {r[0] for r in db.execute(
-        "SELECT DISTINCT hash FROM batch_files WHERE verified != 'failed'")}
-    groups = defaultdict(list)
-    for row in rows:
-        if row["status"] == "local_only":
-            groups[row["pair_id"] or row["relative_path"]].append(row)
-    chosen, used_bytes = [], 0
-    for _, group in sorted(groups.items()):
-        if any(r["hash"] in prepared for r in group):
-            continue
-        if args.max_files and len(chosen) + len(group) > args.max_files:
-            continue
-        new_bytes = sum(r["size"] for r in group)
-        if args.max_bytes and used_bytes + new_bytes > args.max_bytes:
-            continue
-        chosen.extend(group)
-        used_bytes += new_bytes
-    return chosen, used_bytes
+def plan(rows, flatten):
+    """Select every distinct candidate and resolve its destination before writing."""
+    selected = sorted(
+        (row for row in rows if row["status"] == "local_only" and not row["duplicate_of"]),
+        key=lambda row: row["relative_path"])
+    if not flatten:
+        return [dict(row, staged=(Path("media") / row["relative_path"]).as_posix())
+                for row in selected]
 
+    by_group = defaultdict(list)
+    for row in selected:
+        by_group[row["pair_id"] or row["relative_path"]].append(row)
+    groups = []
+    for _, items in sorted(by_group.items()):
+        # A Live Photo's image and movie must share a basename after flattening.
+        representative = next(
+            (row for row in items if Path(row["relative_path"]).suffix.lower() in LIVE_IMAGES),
+            items[0])
+        stem = Path(representative["relative_path"]).stem
+        token = (items[0]["sha256"] if len(items) == 1 else
+                 hashlib.sha256(":".join(sorted(row["sha256"] for row in items))
+                                .encode("ascii")).hexdigest())
+        groups.append({"items": items, "stem": stem, "token": token, "suffix_size": 0})
+
+    # Rename every colliding group. Retry if a generated name happens to
+    # collide with an original name or another generated name.
+    while True:
+        owners = defaultdict(set)
+        staged_paths = {}
+        for index, group in enumerate(groups):
+            suffix = ("__" + group["token"][:group["suffix_size"]]
+                      if group["suffix_size"] else "")
+            for row in group["items"]:
+                extension = Path(row["relative_path"]).suffix
+                name = group["stem"] + suffix + extension
+                if len(name.encode("utf-8")) > 255:
+                    raise PrepError(f"Flattened filename too long: {name}")
+                owners[normalized_name(name)].add(index)
+                staged_paths[row["relative_path"]] = (Path("media") / name).as_posix()
+        collisions = set().union(*(ids for ids in owners.values() if len(ids) > 1))
+        if not collisions:
+            break
+        for index in collisions:
+            group = groups[index]
+            group["suffix_size"] = 8 if not group["suffix_size"] else group["suffix_size"] + 4
+            if group["suffix_size"] > len(group["token"]):
+                raise PrepError("Cannot resolve flattened filename collision")
+    return [dict(row, staged=staged_paths[row["relative_path"]]) for row in selected]
 
 def safe_replicate(source, dest, expected):
     before = source.lstat()
