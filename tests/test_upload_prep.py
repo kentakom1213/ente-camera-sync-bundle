@@ -111,6 +111,48 @@ class UploadPrepTest(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(dest.read_text(), "do not touch")
 
+    def test_explicit_dry_run_does_not_create_staging_or_cache(self):
+        self.file("Old/2021/leaf.jpg", b"private photo")
+        stage = self.base / "preview"
+        self.assertFalse(self.db.exists())
+        rc, output, error = self.invoke(
+            "prepare-upload", str(self.pictures),
+            "--output", str(stage), "--dry-run", remote=[])
+        self.assertEqual(rc, 0, error)
+        self.assertIn("Dry run", output)
+        self.assertIn("Selected 1 files", output)
+        self.assertFalse(stage.exists())
+        self.assertFalse(self.db.exists())
+        self.assertFalse((self.base / ".ente-upload-prep.lock").exists())
+
+    def test_implicit_dry_run_uses_snapshot_without_database_mutation(self):
+        self.file("Original/a.jpg", b"photo A")
+        first = self.base / "first"
+        rc, _, error = self.invoke(
+            "prepare-upload", str(self.pictures),
+            "--output", str(first), "--apply", remote=[])
+        self.assertEqual(rc, 0, error)
+        original_db = self.db.read_bytes()
+        self.file("New/b.jpg", b"photo B")
+        preview = self.base / "second"
+        rc, output, error = self.invoke(
+            "prepare-upload", str(self.pictures),
+            "--output", str(preview), remote=[])
+        self.assertEqual(rc, 0, error)
+        self.assertIn("New/b.jpg", output)
+        self.assertIn("Selected 1 files", output)
+        self.assertFalse(preview.exists())
+        self.assertEqual(self.db.read_bytes(), original_db)
+
+    def test_dry_run_and_apply_options_are_mutually_exclusive(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            prep.parser().parse_args([
+                "--account", "test", "prepare-upload", str(self.pictures),
+                "--output", str(self.base / "batch"),
+                "--dry-run", "--apply",
+            ])
+        self.assertEqual(error.exception.code, 2)
+
     def test_batch_preserves_paths_and_recheck(self):
         src = self.file("Old/2021/leaf.jpg", b"private photo")
         stage = self.base / "stage"
