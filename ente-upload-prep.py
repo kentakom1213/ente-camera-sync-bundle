@@ -605,6 +605,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     os.umask(0o077)  # SQLite, reports, lock and manifests may contain private file paths.
     try:
+        root = None  # verify-upload uses the manifest, not a scanned source directory.
         if args.command in ("local-only", "prepare-upload"):
             supplied_root = args.directory.expanduser()
             if supplied_root.is_symlink():
