@@ -540,6 +540,17 @@ def safe_replicate(source, dest, expected):
     return method
 
 
+
+def human_size(size):
+    """Format a non-negative byte count using binary units."""
+    if size < 1024:
+        return f"{size:,} B"
+    value = float(size)
+    for unit in ("KiB", "MiB", "GiB", "TiB", "PiB"):
+        value /= 1024
+        if value < 1024 or unit == "PiB":
+            return f"{value:.2f} {unit}"
+
 def prepare(args, root, rows, timestamp):
     output = args.output.expanduser().absolute()
     parent = output.parent.resolve(strict=True)
@@ -551,11 +562,9 @@ def prepare(args, root, rows, timestamp):
 
     planned = plan(rows, args.flatten)
     total = sum(row["size"] for row in planned)
-    print(f"Selected {len(planned)} files ({total} bytes) for {output}")
-    for row in planned[:40]:
-        print(f"  {row['relative_path']} -> {row['staged']}")
-    if len(planned) > 40:
-        print(f"  ... and {len(planned) - 40} more")
+    print(f"Files: {len(planned):,}")
+    print(f"Total size: {human_size(total)}")
+    print(f"Destination: {output}")
     if args.dry_run:
         print("Dry run: staging not created.")
         return
