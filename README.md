@@ -7,12 +7,12 @@
 ```zsh
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" local-only ~/Pictures
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
-  prepare-upload ~/Pictures --output ~/share/ente-upload/batch-001 --apply
+  prepare-upload ~/Pictures --output ~/share/ente-upload/batch-001
 python3 ente-upload-prep.py --account "$ENTE_ACCOUNT" \
   verify-upload ~/share/ente-upload/batch-001/manifest.json
 ```
 
-ステージングは元のフォルダ構造を維持し，Reflink を優先，未対応なら Copy します．**Ente へのアップロード操作は実装しておらず，`media/` を Ente Desktop から手動で取り込みます．** 既存の Camera 同期 DB は読み取り専用です．
+`prepare-upload` は通常ステージングを作成し，`--dry-run` でプレビューできます．`--flatten` を付けると単一ディレクトリに配置します．元の構造を維持することもできます．Reflink を優先し，未対応なら Copy します．**Ente へのアップロード操作は実装しておらず，`media/` を Ente Desktop から手動で取り込みます．** 既存の Camera 同期 DB は読み取り専用です．
 
 詳細と注意事項は [LOCAL-UPLOAD-PREPARATION.md](LOCAL-UPLOAD-PREPARATION.md) を参照してください．
 
