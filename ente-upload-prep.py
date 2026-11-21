@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unicodedata
 from urllib.parse import quote
 
@@ -181,13 +182,78 @@ def refresh_history(db, args):
     return entries, timestamp
 
 
-def hash_file(path):
+
+class HashProgress:
+    """Terminal-only progress for scanning media, without external dependencies."""
+
+    def __init__(self, total):
+        self.total = total
+        self.done = 0
+        self.cached = 0
+        self.bytes_read = 0
+        self.current_size = 0
+        self.current_read = 0
+        self.tty = sys.stderr.isatty()
+        self.last_update = 0.0
+        self.last_width = 0
+
+    def begin(self, size):
+        self.current_size = size
+        self.current_read = 0
+
+    def read(self, size):
+        self.bytes_read += size
+        self.current_read += size
+        self.render()
+
+    def finish(self, cached):
+        self.done += 1
+        self.cached += int(cached)
+        self.current_size = 0
+        self.current_read = 0
+        self.render()
+
+    def render(self):
+        if not self.tty:
+            return
+        current_time = time.monotonic()
+        if self.done < self.total and current_time - self.last_update < 0.1:
+            return
+        self.last_update = current_time
+        fraction = 0 if not self.total else (
+            self.done + min(1.0, self.current_read / self.current_size)
+            if self.current_size else self.done) / self.total
+        width = 20
+        filled = int(width * fraction)
+        line = (f"Hash scan [{'#' * filled}{'-' * (width - filled)}] "
+                f"{self.done}/{self.total} files, "
+                f"{self.bytes_read / (1024 ** 3):.2f} GiB read, "
+                f"{self.cached} cached")
+        # Erase any remaining text from a previously longer progress line.
+        sys.stderr.write("\r" + line + " " * max(0, self.last_width - len(line)))
+        sys.stderr.flush()
+        self.last_width = len(line)
+
+    def close(self):
+        if self.tty:
+            self.render()
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            print(f"Hash scan: {self.done}/{self.total} files, "
+                  f"{self.bytes_read / (1024 ** 3):.2f} GiB read, "
+                  f"{self.cached} cached", file=sys.stderr)
+
+
+def hash_file(path, on_bytes=None):
     first = path.lstat()
     sha, b2 = hashlib.sha256(), hashlib.blake2b(digest_size=64)
     with path.open("rb") as file:
         while buf := file.read(CHUNK):
             sha.update(buf)
             b2.update(buf)
+            if on_bytes is not None:
+                on_bytes(len(buf))
     second = path.lstat()
     attrs = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
     if path.is_symlink() or any(getattr(first, a) != getattr(second, a) for a in attrs):
@@ -237,40 +303,50 @@ def scan(db, args, root, current, timestamp):
                 history_ids[value].add(file_id)
     camera = indexed_camera(args.camera_db, args.account)
     rows = []
-    for path, kind in scan_paths(root, args.exclude):
-        stat = path.lstat()
-        cache = db.execute("SELECT size,mtime_ns,ctime_ns,dev,inode,sha256,blake2b "
-                           "FROM scan_files WHERE path=?", (str(path),)).fetchone()
-        unchanged = cache and (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
-                               stat.st_dev, stat.st_ino) == tuple(cache[:5])
-        if unchanged and not args.rehash:
-            sha, digest = cache[5:7]
-        elif not args.rehash and str(path) in camera and \
-                (stat.st_size, stat.st_mtime_ns) == camera[str(path)][:2]:
-            sha, digest = camera[str(path)][2:4]
-        else:
-            sha, digest, stat = hash_file(path)
-        db.execute("""INSERT INTO scan_files VALUES(?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
-            ctime_ns=excluded.ctime_ns,dev=excluded.dev,inode=excluded.inode,
-            sha256=excluded.sha256,blake2b=excluded.blake2b,checked_at=excluded.checked_at""",
-            (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev,
-             stat.st_ino, sha, digest, timestamp))
-        matches = current_by_hash.get(digest, [])
-        exact_name = any(item.get("name") == path.name for item in matches)
-        if matches:
-            status = "uploaded"
-        elif digest in history_ids:
-            status = "previously_seen"
-        else:
-            status = "local_only"
-        rows.append({"path": str(path), "relative_path": path.relative_to(root).as_posix(),
-                     "size": stat.st_size, "sha256": sha, "hash": digest, "kind": kind,
-                     "status": status, "reason": "", "pair_id": None,
-                     "name_mismatch": bool(matches and not exact_name),
-                     "duplicate_of": None,
-                     "matching_ente_ids": sorted({m["id"] for m in matches}),
-                     "historical_ente_ids": sorted(history_ids.get(digest, set()))})
+    files = list(scan_paths(root, args.exclude))
+    progress = HashProgress(len(files))
+    try:
+        for path, kind in files:
+            stat = path.lstat()
+            cache = db.execute("SELECT size,mtime_ns,ctime_ns,dev,inode,sha256,blake2b "
+                               "FROM scan_files WHERE path=?", (str(path),)).fetchone()
+            unchanged = cache and (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+                                   stat.st_dev, stat.st_ino) == tuple(cache[:5])
+            cached = True
+            if unchanged and not args.rehash:
+                sha, digest = cache[5:7]
+            elif not args.rehash and str(path) in camera and \
+                    (stat.st_size, stat.st_mtime_ns) == camera[str(path)][:2]:
+                sha, digest = camera[str(path)][2:4]
+            else:
+                cached = False
+                progress.begin(stat.st_size)
+                sha, digest, stat = hash_file(path, on_bytes=progress.read)
+            db.execute("""INSERT INTO scan_files VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,
+                ctime_ns=excluded.ctime_ns,dev=excluded.dev,inode=excluded.inode,
+                sha256=excluded.sha256,blake2b=excluded.blake2b,checked_at=excluded.checked_at""",
+                (str(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev,
+                 stat.st_ino, sha, digest, timestamp))
+            matches = current_by_hash.get(digest, [])
+            exact_name = any(item.get("name") == path.name for item in matches)
+            if matches:
+                status = "uploaded"
+            elif digest in history_ids:
+                status = "previously_seen"
+            else:
+                status = "local_only"
+            rows.append({"path": str(path), "relative_path": path.relative_to(root).as_posix(),
+                         "size": stat.st_size, "sha256": sha, "hash": digest, "kind": kind,
+                         "status": status, "reason": "", "pair_id": None,
+                         "name_mismatch": bool(matches and not exact_name),
+                         "duplicate_of": None,
+                         "matching_ente_ids": sorted({m["id"] for m in matches}),
+                         "historical_ente_ids": sorted(history_ids.get(digest, set()))})
+            progress.finish(cached)
+
+    finally:
+        progress.close()
     db.commit()
     tag_livephoto_pairs(rows, current)
     tag_duplicates(rows)
