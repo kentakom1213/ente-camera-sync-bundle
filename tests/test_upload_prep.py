@@ -81,6 +81,38 @@ class UploadPrepTest(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertEqual(len(list(self.db.parent.glob("*.jpg"))), 0)
 
+    def test_hash_progress_excludes_cache_hits(self):
+        self.file("Camera/a.jpg", b"alpha")
+        self.file("Camera/b.jpg", b"beta")
+        rc, _, info = self.report(remote=[])
+        self.assertEqual(rc, 0, info)
+        self.assertIn("Hash scan: 2/2 files", info)
+        self.assertIn("0 cached", info)
+        rc, _, info = self.report(remote=[])
+        self.assertEqual(rc, 0, info)
+        self.assertIn("Hash scan: 2/2 files", info)
+        self.assertIn("2 cached", info)
+        rc, _, info = self.report(remote=[], extra=("--rehash",))
+        self.assertEqual(rc, 0, info)
+        self.assertIn("0 cached", info)
+
+    def test_hash_progress_tty_bar_and_byte_count(self):
+        terminal = io.StringIO()
+        with patch.object(terminal, "isatty", return_value=True), redirect_stderr(terminal):
+            progress = prep.HashProgress(2)
+            progress.begin(10)
+            progress.read(4)
+            progress.read(6)
+            progress.finish(cached=False)
+            progress.finish(cached=True)
+            progress.close()
+        output = terminal.getvalue()
+        self.assertIn("Hash scan [", output)
+        self.assertIn("2/2 files", output)
+        self.assertIn("1 cached", output)
+        self.assertEqual(progress.bytes_read, 10)
+        self.assertTrue(output.endswith("\n"))
+
     def test_history_persists_after_deleted_remote_item(self):
         self.file("lost.jpg", b"old remote")
         self.assertEqual(self.report(remote=[media(1, "lost.jpg", b"old remote")])[0], 0)
