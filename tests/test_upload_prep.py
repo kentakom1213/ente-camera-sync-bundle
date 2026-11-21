@@ -113,6 +113,61 @@ class UploadPrepTest(unittest.TestCase):
         self.assertEqual(progress.bytes_read, 10)
         self.assertTrue(output.endswith("\n"))
 
+    def test_stage_progress_tty_copy_and_reflink(self):
+        output = io.StringIO()
+        with patch.object(output, "isatty", return_value=True), redirect_stderr(output):
+            progress = prep.StageProgress(2, 20)
+            progress.start()
+            progress.copied(4)
+            progress.copied(6)
+            progress.verifying()
+            progress.finish(10, "copy")
+            progress.start()
+            progress.verifying()
+            progress.finish(10, "reflink")
+            progress.close()
+        result = output.getvalue()
+        self.assertIn("Staging [", result)
+        self.assertIn("1/2 files", result)
+        self.assertIn("2/2 files, 20 B / 20 B, 1 reflink, 1 copy", result)
+        self.assertIn("(verifying)", result)
+        self.assertTrue(result.endswith("\n"))
+        self.assertEqual(progress.done_bytes, 20)
+
+    def test_staging_reports_aggregate_copy_progress_without_filenames(self):
+        import errno
+        self.file("HiddenLocation/large.jpg", b"z" * (prep.CHUNK + 123))
+        stage = self.base / "batch"
+        with patch.object(prep.fcntl, "ioctl",
+                          side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+            rc, out, err = self.invoke(
+                "prepare-upload", str(self.pictures), "--output", str(stage), remote=[])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Staging: 1/1 files", err)
+        self.assertIn("0 reflink, 1 copy", err)
+        self.assertNotIn("large.jpg", err)
+        self.assertNotIn("HiddenLocation", err)
+        self.assertEqual((stage / "media/HiddenLocation/large.jpg").stat().st_size,
+                         prep.CHUNK + 123)
+
+    def test_copy_byte_callback_reports_each_written_chunk(self):
+        import errno
+        data = b"c" * (prep.CHUNK + 37)
+        src = self.file("file.jpg", data)
+        dst = self.base / "copied.jpg"
+        amounts, phases = [], []
+        expected = {"sha256": hashlib.sha256(data).hexdigest(),
+                    "hash": digest(data), "size": len(data)}
+        with patch.object(prep.fcntl, "ioctl",
+                          side_effect=OSError(errno.EOPNOTSUPP, "unsupported")):
+            method = prep.safe_replicate(
+                src, dst, expected, on_copy_bytes=amounts.append,
+                on_verifying=lambda: phases.append("verifying"))
+        self.assertEqual(method, "copy")
+        self.assertEqual(amounts, [prep.CHUNK, 37])
+        self.assertEqual(phases, ["verifying"])
+        self.assertEqual(dst.read_bytes(), data)
+
     def test_history_persists_after_deleted_remote_item(self):
         self.file("lost.jpg", b"old remote")
         self.assertEqual(self.report(remote=[media(1, "lost.jpg", b"old remote")])[0], 0)
